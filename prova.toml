@@ -1,0 +1,8 @@
+# Self-test manifest: resolve this plugin from its own directory (via prova-plugin.toml) and run
+# tests/. A consumer would instead declare `deploy = "p6m-archetypes/prova-p6m-deploy-loop@v1"`
+# (or a path pin while incubating).
+[run]
+proofs = ["tests"]
+
+[plugins]
+deploy = { path = "." }

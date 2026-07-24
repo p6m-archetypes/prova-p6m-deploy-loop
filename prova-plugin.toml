@@ -1,0 +1,7 @@
+[plugin]
+name        = "deploy"
+entry       = "deploy.lua"
+description = "p6m archetype deploy-loop proof: render -> push -> Build -> release/digest -> .platform dispatch -> ArgoCD Synced/Healthy -> Deployment/Pods."
+
+[requires]
+prova = ">=0.9"
