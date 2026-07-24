@@ -256,13 +256,39 @@ local function app_snapshot(name)
   return table.concat(lines, "\n")
 end
 
--- Log a failed Build's run URL and the failed job/step names (safe metadata - never dumps logs, so
--- there is no chance of leaking secrets into output).
+-- A one-line progress note for the Build heartbeat: the overall run status PLUS the job/step
+-- currently in flight, so a live run shows WHICH step it is on, not just "in_progress". One `gh`
+-- call; degrades to a bare status if the jobs aren't readable yet.
+local function build_brief(repo, run_id)
+  local r = sh("gh run view " .. run_id .. " --repo " .. repo .. " --json status,jobs")
+  local ok, data = pcall(prova.parse.json, r.stdout)
+  if not ok or type(data) ~= "table" then return "status unknown" end
+  local status = "status=" .. (data.status or "?")
+  -- Report the first in-progress step of the first in-progress job (the CI runs jobs serially here).
+  for _, job in ipairs(data.jobs or {}) do
+    if job.status == "in_progress" then
+      for _, step in ipairs(job.steps or {}) do
+        if step.status == "in_progress" then
+          return status .. " - " .. (job.name or "?") .. " / " .. (step.name or "?")
+        end
+      end
+      return status .. " - " .. (job.name or "?")
+    end
+  end
+  return status
+end
+
+-- Log a failed Build's run URL, the failed job/step names, and the failed steps' log tail so a run
+-- that dies mid-loop is diagnosable inline (teardown wipes the repo right after). GitHub Actions
+-- masks registered secrets as *** in run logs, so `--log-failed` never surfaces raw credentials; we
+-- still tail it (not the full run log) to keep the console readable and the blast radius small.
 local function log_build_failure(t, repo, run_id, url)
   t:log("Build failed - see " .. url)
   local failed = sh("gh run view " .. run_id .. " --repo " .. repo ..
     [[ --json jobs -q '.jobs[] | select(.conclusion=="failure") | "  job: " + .name, (.steps[] | select(.conclusion=="failure") | "    step: " + .name)']])
-  if trim(failed.stdout) ~= "" then t:log("failed:\n" .. failed.stdout) end
+  if trim(failed.stdout) ~= "" then t:log("failed jobs/steps:\n" .. failed.stdout) end
+  local logs = sh("gh run view " .. run_id .. " --repo " .. repo .. " --log-failed 2>/dev/null | tail -n 100")
+  if trim(logs.stdout) ~= "" then t:log("failed step log (last 100 lines, secrets masked by GitHub):\n" .. logs.stdout) end
 end
 
 ------------------------------------------------------------------------------------------
@@ -417,9 +443,7 @@ function stages.build(t, run)
 
   poll(t, "the Build workflow to finish", cfg.timeouts.build, cfg.timeouts.poll_interval, function()
     return trim(sh("gh run view " .. run_id .. " --repo " .. state.repo .. " --json status -q .status").stdout) == "completed"
-  end, { tick = function()
-    return "run status=" .. trim(sh("gh run view " .. run_id .. " --repo " .. state.repo .. " --json status -q .status").stdout)
-  end })
+  end, { tick = function() return build_brief(state.repo, run_id) end })
 
   local conclusion = trim(sh("gh run view " .. run_id .. " --repo " .. state.repo .. " --json conclusion -q .conclusion").stdout)
   if conclusion ~= "success" then
