@@ -67,13 +67,19 @@ deploy.flow(deploy.from_env{
 | `digest_deployed` | the deployed pods run the built digest |
 | `pods_stable` | the workload stays Healthy through a window (default **30 s**) |
 
-A failed Build is **re-run in place** (`gh run rerun` - a new attempt on the same run) before the step
-gives up, because a fresh repo's first build fails on infrastructure flake (runner, registry,
-dependency mirror) often enough that one failure isn't yet a verdict on the archetype. Every failure is
+A Build that succeeds on the first attempt just continues. A failed one is **re-run in place**
+(`gh run rerun` - a new attempt on the same run) before the step gives up, because a fresh repo's first
+build fails on infrastructure flake (runner, registry, dependency mirror) often enough that one failure
+isn't yet a verdict on the archetype. Every failure is
 logged in full - run URL, failed jobs/steps, log tail - so a run that only passed on a retry says so.
 Total attempts are `1 + build_retries` (default `1 + 3`), each with the full `timeouts.build` budget;
 if you expect to use them all, raise `flow_timeout` to match (4 x 1800 s exceeds the default `5400s`).
 Set `build_retries = 0` for fail-on-first-failure.
+
+The step only needs `gh run view --json status,conclusion` to decide anything; `updatedAt` and `attempt`
+sharpen the re-run bookkeeping and are dropped automatically on a `gh` that doesn't expose them. If the
+run cannot be read at all, the step fails immediately with `gh`'s own message rather than polling to a
+timeout on a Build that may well have succeeded.
 
 ### Credentials never reach the console
 

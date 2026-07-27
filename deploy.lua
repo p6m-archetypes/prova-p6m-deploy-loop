@@ -407,23 +407,53 @@ local function app_snapshot(name)
   return table.concat(lines, "\n")
 end
 
--- The Build run's status/conclusion/attempt in one `gh` call, or nil if it isn't readable yet.
+-- Fields every `gh` release exposes on `gh run view --json`, plus the ones only newer ones do. `attempt`
+-- is NOT universal: an older gh rejects the whole query with `Unknown JSON field: "attempt"` and exits
+-- 1. Asking for it unconditionally is what made a SUCCESSFUL Build time out - the state read failed on
+-- every poll, so the wait ran to `timeouts.build` and reported a timeout on a run that had passed. So
+-- the optional fields are dropped for the rest of the process the first time gh refuses them.
+-- The base pair is what the stage actually needs to decide anything; `updatedAt`/`attempt` only sharpen
+-- the re-run bookkeeping, and the code degrades cleanly without them.
+local BUILD_FIELDS_BASE = "status,conclusion"
+local build_fields = BUILD_FIELDS_BASE .. ",updatedAt,attempt"
+
+-- The Build run's state in one `gh` call. Returns the parsed object, or nil plus a human reason - the
+-- reason matters: it goes into the heartbeat, so a stuck wait says WHY instead of just counting.
 local function build_run_state(repo, run_id)
-  local r = sh("gh run view " .. run_id .. " --repo " .. repo .. " --json status,conclusion,attempt")
-  if not r:ok() then return nil end
+  local function view(fields)
+    return sh("gh run view " .. run_id .. " --repo " .. repo .. " --json " .. fields)
+  end
+  local r = view(build_fields)
+  if not r:ok() and build_fields ~= BUILD_FIELDS_BASE then
+    local base = view(BUILD_FIELDS_BASE)
+    if base:ok() then build_fields = BUILD_FIELDS_BASE; r = base end
+  end
+  if not r:ok() then
+    local why = trim(r.stderr) ~= "" and trim(r.stderr) or trim(r.stdout)
+    return nil, why ~= "" and why:gsub("%s+", " ") or ("gh run view exited " .. tostring(r.code))
+  end
   local ok, data = pcall(prova.parse.json, r.stdout)
-  if not ok or type(data) ~= "table" then return nil end
+  if not ok or type(data) ~= "table" then return nil, "gh run view returned unreadable JSON" end
   return data
 end
 
--- A one-line progress note for the Build heartbeat: the run's attempt + overall status PLUS the
--- job/step currently in flight, so a live run shows WHICH step it is on, not just "in_progress". One
--- `gh` call; degrades to a bare status if the jobs aren't readable yet.
+-- Identify the FINISHED attempt we just consumed the result of, so a later wait can tell a genuinely
+-- new attempt from the one already seen. Returns nil when neither field is available - callers then
+-- skip the check rather than gate on a constant, which would wait forever.
+local function finished_signature(s)
+  if not s.attempt and not s.updatedAt then return nil end
+  return tostring(s.attempt or "?") .. "@" .. tostring(s.updatedAt or "?")
+end
+
+-- A one-line progress note for the Build heartbeat: the overall status PLUS the job/step currently in
+-- flight, so a live run shows WHICH step it is on, not just "in_progress". One `gh` call, asking only
+-- for fields every gh release has (the wait's own label already carries the attempt number); degrades
+-- to a bare status if the jobs aren't readable yet.
 local function build_brief(repo, run_id)
-  local r = sh("gh run view " .. run_id .. " --repo " .. repo .. " --json status,attempt,jobs")
+  local r = sh("gh run view " .. run_id .. " --repo " .. repo .. " --json status,jobs")
   local ok, data = pcall(prova.parse.json, r.stdout)
   if not ok or type(data) ~= "table" then return "status unknown" end
-  local status = "attempt=" .. (data.attempt or 1) .. " status=" .. (data.status or "?")
+  local status = "status=" .. (data.status or "?")
   -- Report the first in-progress step of the first in-progress job (the CI runs jobs serially here).
   for _, job in ipairs(data.jobs or {}) do
     if job.status == "in_progress" then
@@ -455,20 +485,19 @@ local function log_build_failure(t, repo, run_id, url, what)
   end
 end
 
--- Wait for attempt #`attempt` of Build run `run_id` to finish, and return its conclusion. Keyed on the
--- attempt NUMBER, not just "completed": right after a `gh run rerun` the run still reports the previous
--- attempt as completed, and a fast re-failure can complete inside one poll gap - a bare status check
--- would mistake either for the result of the attempt we are waiting on.
-local function await_build_attempt(t, cfg, repo, run_id, attempt, attempts)
-  local desc = attempts > 1
-    and string.format("Build attempt %d/%d to finish", attempt, attempts)
-    or "the Build workflow to finish"
-  local final = poll(t, desc, cfg.timeouts.build, cfg.timeouts.poll_interval, function()
-    local s = build_run_state(repo, run_id)
-    if s and (s.attempt or 1) >= attempt and s.status == "completed" then return s end
-  end, { tick = function() return build_brief(repo, run_id) end })
-  local conclusion = (final or {}).conclusion or ""
-  return conclusion ~= "" and conclusion or "unknown"
+-- Wait for the Build run to finish and return its state. `already_seen` is the signature of an attempt
+-- whose result a previous wait already consumed: while gh still reports THAT attempt as completed, the
+-- re-run has not registered yet and we keep waiting. It is nil on the first wait - there is nothing to
+-- disambiguate, so the first `completed` is the answer and a Build that passes first time continues
+-- immediately, with no dependence on any optional field.
+local function await_build(t, cfg, repo, run_id, desc, already_seen)
+  local unreadable
+  return poll(t, desc, cfg.timeouts.build, cfg.timeouts.poll_interval, function()
+    local s; s, unreadable = build_run_state(repo, run_id)
+    if not s or s.status ~= "completed" then return nil end
+    if already_seen and finished_signature(s) == already_seen then return nil end
+    return s
+  end, { tick = function() return unreadable or build_brief(repo, run_id) end })
 end
 
 ------------------------------------------------------------------------------------------
@@ -625,13 +654,34 @@ function stages.build(t, run)
   local url = sh_out("gh run view " .. run_id .. " --repo " .. state.repo .. " --json url -q .url")
   t:log("run " .. run_id .. " - " .. url)
 
+  -- Prove the state read works before settling in to wait on it. If it is broken - an unsupported --json
+  -- field on an older gh, a token that cannot see the repo - fail NOW, with gh's own message: polling
+  -- first turns that into a silent `timeouts.build` timeout on a Build that had SUCCEEDED, which is
+  -- exactly how this stage failed before. A few tries first, so a transient blip is not a verdict.
+  local unreadable
+  for probe = 1, 3 do
+    local s; s, unreadable = build_run_state(state.repo, run_id)
+    if s then break end
+    if probe < 3 and cfg.timeouts.stability_interval > 0 then
+      prova.sleep(cfg.timeouts.stability_interval * 1000)
+    end
+  end
+  if unreadable then error("cannot read Build run " .. run_id .. ": " .. unreadable, 0) end
+
   -- A failed Build is re-run in place (`gh run rerun` = a new attempt on the SAME run) up to
   -- cfg.build_retries times, since a fresh repo's first build fails on infrastructure flake often
   -- enough - runner/registry/dependency-mirror hiccups - that one failure is not yet a verdict on the
-  -- archetype. Every failure is still logged in full, so a run that only passed on a retry says so.
+  -- archetype. A Build that passes first time just continues. Every failure is still logged in full, so
+  -- a run that only passed on a retry says so.
   local attempts = 1 + cfg.build_retries
+  local seen   -- signature of the finished attempt we already have a verdict for (nil until we do)
   for attempt = 1, attempts do
-    local conclusion = await_build_attempt(t, cfg, state.repo, run_id, attempt, attempts)
+    local desc = attempts > 1
+      and string.format("Build attempt %d/%d to finish", attempt, attempts)
+      or "the Build workflow to finish"
+    local finished = await_build(t, cfg, state.repo, run_id, desc, seen) or {}
+    seen = finished_signature(finished)
+    local conclusion = (finished.conclusion or "") ~= "" and finished.conclusion or "unknown"
     if conclusion == "success" then
       t:log(attempt == 1 and "Build succeeded"
         or string.format("Build succeeded on attempt %d/%d", attempt, attempts))
