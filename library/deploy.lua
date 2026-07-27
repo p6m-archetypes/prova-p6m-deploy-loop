@@ -39,6 +39,7 @@
 ---@field argo_app_suffix? string     # app is "<project>-<suffix>" (default "dev-azure-westus2")
 ---@field keep_resources? boolean     # skip teardown (default false)
 ---@field teardown_retries? integer   # rebase-and-retry attempts for the .platform removal push (default 3)
+---@field build_retries? integer      # re-runs of a FAILED Build workflow before giving up (default 3; total attempts = 1 + this, each with the full `timeouts.build` budget)
 ---@field requires? string[]          # capabilities gating the flow (default {"archetect","gh","git","argocd"})
 ---@field flow_timeout? string        # whole-flow timeout (default "5400s")
 ---@field timeouts? deploy.Timeouts
@@ -86,7 +87,7 @@
 ---@field preflight deploy.Stage           # tools authenticated (gh + argocd)
 ---@field render deploy.Stage              # archetect render; asserts full-loop CI
 ---@field push deploy.Stage                # create GitHub repo + push
----@field build deploy.Stage               # Build workflow kicked off + succeeded
+---@field build deploy.Stage               # Build workflow kicked off + succeeded (re-runs it on failure, up to `build_retries`)
 ---@field release deploy.Stage             # git tag + release; captures the image digest
 ---@field platform deploy.Stage            # .platform manifest updated with the digest
 ---@field argo_appears deploy.Stage        # ArgoCD app appears
@@ -124,7 +125,7 @@ function deploy.resolve(config) end
 --- Build a config table from environment variables, then layer `overrides` on top. Reads
 --- ARCHETYPE_DIR/ARCHETYPE_SOURCE/ANSWERS_FILE, GITHUB_ORG/REPO_NAME/PLATFORM_REPO, ENVIRONMENT,
 --- ARGO_APP_SUFFIX, PROJECT_PREFIX/PROJECT_SUFFIX/RUN_ID/PREFIX_KEY, KEEP_RESOURCES,
---- TEARDOWN_PUSH_RETRIES, E2E_FLOW_TIMEOUT, and CI_TIMEOUT/PLATFORM_TIMEOUT/ARGO_APPEAR_TIMEOUT/
+--- TEARDOWN_PUSH_RETRIES, BUILD_RETRIES, E2E_FLOW_TIMEOUT, and CI_TIMEOUT/PLATFORM_TIMEOUT/ARGO_APPEAR_TIMEOUT/
 --- ARGO_TIMEOUT/DEPLOYMENT_TIMEOUT/PODS_STABLE_SECONDS/POLL_INTERVAL.
 ---@param overrides? deploy.Config
 ---@return deploy.Config
