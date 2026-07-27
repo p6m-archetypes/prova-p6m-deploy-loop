@@ -44,6 +44,9 @@ deploy.defaults = {
 
   keep_resources   = false,
   teardown_retries = 3,
+  -- Re-runs of a FAILED Build workflow before the stage gives up (total attempts = 1 + this). Each
+  -- attempt gets the full timeouts.build budget, so raise flow_timeout if you expect to use them all.
+  build_retries    = 3,
 
   requires     = { "archetect", "gh", "git", "argocd" },
   flow_timeout = "5400s",
@@ -107,6 +110,7 @@ function deploy.from_env(overrides)
     prefix_key       = e("PREFIX_KEY"),
     keep_resources   = e("KEEP_RESOURCES") ~= nil or nil,
     teardown_retries = n("TEARDOWN_PUSH_RETRIES"),
+    build_retries    = n("BUILD_RETRIES"),
     flow_timeout     = e("E2E_FLOW_TIMEOUT"),
     timeouts = {
       build       = n("CI_TIMEOUT"),
@@ -256,14 +260,23 @@ local function app_snapshot(name)
   return table.concat(lines, "\n")
 end
 
--- A one-line progress note for the Build heartbeat: the overall run status PLUS the job/step
--- currently in flight, so a live run shows WHICH step it is on, not just "in_progress". One `gh`
--- call; degrades to a bare status if the jobs aren't readable yet.
+-- The Build run's status/conclusion/attempt in one `gh` call, or nil if it isn't readable yet.
+local function build_run_state(repo, run_id)
+  local r = sh("gh run view " .. run_id .. " --repo " .. repo .. " --json status,conclusion,attempt")
+  if not r:ok() then return nil end
+  local ok, data = pcall(prova.parse.json, r.stdout)
+  if not ok or type(data) ~= "table" then return nil end
+  return data
+end
+
+-- A one-line progress note for the Build heartbeat: the run's attempt + overall status PLUS the
+-- job/step currently in flight, so a live run shows WHICH step it is on, not just "in_progress". One
+-- `gh` call; degrades to a bare status if the jobs aren't readable yet.
 local function build_brief(repo, run_id)
-  local r = sh("gh run view " .. run_id .. " --repo " .. repo .. " --json status,jobs")
+  local r = sh("gh run view " .. run_id .. " --repo " .. repo .. " --json status,attempt,jobs")
   local ok, data = pcall(prova.parse.json, r.stdout)
   if not ok or type(data) ~= "table" then return "status unknown" end
-  local status = "status=" .. (data.status or "?")
+  local status = "attempt=" .. (data.attempt or 1) .. " status=" .. (data.status or "?")
   -- Report the first in-progress step of the first in-progress job (the CI runs jobs serially here).
   for _, job in ipairs(data.jobs or {}) do
     if job.status == "in_progress" then
@@ -282,13 +295,29 @@ end
 -- that dies mid-loop is diagnosable inline (teardown wipes the repo right after). GitHub Actions
 -- masks registered secrets as *** in run logs, so `--log-failed` never surfaces raw credentials; we
 -- still tail it (not the full run log) to keep the console readable and the blast radius small.
-local function log_build_failure(t, repo, run_id, url)
-  t:log("Build failed - see " .. url)
+local function log_build_failure(t, repo, run_id, url, what)
+  t:log((what or "Build") .. " failed - see " .. url)
   local failed = sh("gh run view " .. run_id .. " --repo " .. repo ..
     [[ --json jobs -q '.jobs[] | select(.conclusion=="failure") | "  job: " + .name, (.steps[] | select(.conclusion=="failure") | "    step: " + .name)']])
   if trim(failed.stdout) ~= "" then t:log("failed jobs/steps:\n" .. failed.stdout) end
   local logs = sh("gh run view " .. run_id .. " --repo " .. repo .. " --log-failed 2>/dev/null | tail -n 100")
   if trim(logs.stdout) ~= "" then t:log("failed step log (last 100 lines, secrets masked by GitHub):\n" .. logs.stdout) end
+end
+
+-- Wait for attempt #`attempt` of Build run `run_id` to finish, and return its conclusion. Keyed on the
+-- attempt NUMBER, not just "completed": right after a `gh run rerun` the run still reports the previous
+-- attempt as completed, and a fast re-failure can complete inside one poll gap - a bare status check
+-- would mistake either for the result of the attempt we are waiting on.
+local function await_build_attempt(t, cfg, repo, run_id, attempt, attempts)
+  local desc = attempts > 1
+    and string.format("Build attempt %d/%d to finish", attempt, attempts)
+    or "the Build workflow to finish"
+  local final = poll(t, desc, cfg.timeouts.build, cfg.timeouts.poll_interval, function()
+    local s = build_run_state(repo, run_id)
+    if s and (s.attempt or 1) >= attempt and s.status == "completed" then return s end
+  end, { tick = function() return build_brief(repo, run_id) end })
+  local conclusion = (final or {}).conclusion or ""
+  return conclusion ~= "" and conclusion or "unknown"
 end
 
 ------------------------------------------------------------------------------------------
@@ -441,16 +470,33 @@ function stages.build(t, run)
   local url = sh_out("gh run view " .. run_id .. " --repo " .. state.repo .. " --json url -q .url")
   t:log("run " .. run_id .. " - " .. url)
 
-  poll(t, "the Build workflow to finish", cfg.timeouts.build, cfg.timeouts.poll_interval, function()
-    return trim(sh("gh run view " .. run_id .. " --repo " .. state.repo .. " --json status -q .status").stdout) == "completed"
-  end, { tick = function() return build_brief(state.repo, run_id) end })
+  -- A failed Build is re-run in place (`gh run rerun` = a new attempt on the SAME run) up to
+  -- cfg.build_retries times, since a fresh repo's first build fails on infrastructure flake often
+  -- enough - runner/registry/dependency-mirror hiccups - that one failure is not yet a verdict on the
+  -- archetype. Every failure is still logged in full, so a run that only passed on a retry says so.
+  local attempts = 1 + cfg.build_retries
+  for attempt = 1, attempts do
+    local conclusion = await_build_attempt(t, cfg, state.repo, run_id, attempt, attempts)
+    if conclusion == "success" then
+      t:log(attempt == 1 and "Build succeeded"
+        or string.format("Build succeeded on attempt %d/%d", attempt, attempts))
+      return
+    end
 
-  local conclusion = trim(sh("gh run view " .. run_id .. " --repo " .. state.repo .. " --json conclusion -q .conclusion").stdout)
-  if conclusion ~= "success" then
-    log_build_failure(t, state.repo, run_id, url)
-    error("Build workflow failed: " .. (conclusion ~= "" and conclusion or "unknown"))
+    local what = attempts > 1 and string.format("Build attempt %d/%d", attempt, attempts) or "Build"
+    log_build_failure(t, state.repo, run_id, url, what)
+    if attempt == attempts then
+      error(string.format("Build workflow failed: %s (after %d attempt%s)",
+        conclusion, attempts, attempts == 1 and "" or "s"), 0)
+    end
+
+    t:log(string.format("re-running Build run %s (attempt %d/%d)", run_id, attempt + 1, attempts))
+    local r = sh("gh run rerun " .. run_id .. " --repo " .. state.repo)
+    if not r:ok() then
+      local why = trim(r.stderr) ~= "" and trim(r.stderr) or trim(r.stdout)
+      error("could not re-run Build run " .. run_id .. ": " .. why, 0)
+    end
   end
-  t:log("Build succeeded")
 end
 
 function stages.release(t, run)

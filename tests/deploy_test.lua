@@ -54,6 +54,11 @@ prova.test("carries the requested default timeouts", function(t)
   t:expect(d.pods_stable, "pods stable default = 30 s"):equals(30)
 end)
 
+prova.test("retries a failed Build by default", function(t)
+  t:expect(deploy.defaults.build_retries, "Build re-runs on failure = 3"):equals(3)
+  t:expect(deploy.resolve{ build_retries = 0 }.build_retries, "0 disables the retry"):equals(0)
+end)
+
 prova.test("resolve merges overrides and fills derived fields", function(t)
   local cfg = deploy.resolve{ github_org = "acme-playground", timeouts = { deployment = 240 } }
   t:expect(cfg.github_org, "override wins"):equals("acme-playground")

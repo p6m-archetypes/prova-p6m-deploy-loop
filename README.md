@@ -58,7 +58,7 @@ deploy.flow(deploy.from_env{
 | `setup` | `gh` + `argocd` are authenticated |
 | `render` | `archetect` renders; the generated CI is the full loop (not the stub) |
 | `push` | the repo is created and pushed |
-| `build` | the Build workflow is kicked off and succeeds |
+| `build` | the Build workflow is kicked off and succeeds (a failed run is re-run in place, up to `build_retries` = **3** times) |
 | `release` | a git tag + release exist; **captures the image digest** |
 | `platform` | the `.platform` manifest was updated with that digest |
 | `argo_appears` | the ArgoCD app appears (default **5 min**) |
@@ -66,6 +66,14 @@ deploy.flow(deploy.from_env{
 | `deployment_healthy` | the live Deployment reports Available=True, readyReplicas >= desired (default **3 min**) |
 | `digest_deployed` | the deployed pods run the built digest |
 | `pods_stable` | the workload stays Healthy through a window (default **30 s**) |
+
+A failed Build is **re-run in place** (`gh run rerun` - a new attempt on the same run) before the step
+gives up, because a fresh repo's first build fails on infrastructure flake (runner, registry,
+dependency mirror) often enough that one failure isn't yet a verdict on the archetype. Every failure is
+logged in full - run URL, failed jobs/steps, log tail - so a run that only passed on a retry says so.
+Total attempts are `1 + build_retries` (default `1 + 3`), each with the full `timeouts.build` budget;
+if you expect to use them all, raise `flow_timeout` to match (4 x 1800 s exceeds the default `5400s`).
+Set `build_retries = 0` for fail-on-first-failure.
 
 Teardown runs at the end - whether the flow passed, failed, or skipped - unless `keep_resources`
 is set: it removes `kubernetes/<project>/` from the `.platform` repo (rebase-and-retry push to the
@@ -156,6 +164,7 @@ for every knob. `deploy.from_env(overrides)` builds one from environment variabl
 | `PREFIX_KEY` | `prefix_key` | `prefix_name` |
 | `KEEP_RESOURCES` | `keep_resources` | `false` |
 | `TEARDOWN_PUSH_RETRIES` | `teardown_retries` | `3` |
+| `BUILD_RETRIES` | `build_retries` | `3` |
 | `E2E_FLOW_TIMEOUT` | `flow_timeout` | `5400s` |
 | `CI_TIMEOUT` | `timeouts.build` | `1800` |
 | `PLATFORM_TIMEOUT` | `timeouts.platform` | `600` |
