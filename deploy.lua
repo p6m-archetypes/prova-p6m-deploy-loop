@@ -417,8 +417,23 @@ end
 local BUILD_FIELDS_BASE = "status,conclusion"
 local build_fields = BUILD_FIELDS_BASE .. ",updatedAt,attempt"
 
--- The Build run's state in one `gh` call. Returns the parsed object, or nil plus a human reason - the
--- reason matters: it goes into the heartbeat, so a stuck wait says WHY instead of just counting.
+-- A short, redacted, single-line excerpt of command output, for a diagnostic that names what actually
+-- came back instead of leaving the next reader to guess.
+local function excerpt(s, limit)
+  local one_line = deploy.redact(trim(s or "")):gsub("%s+", " ")
+  limit = limit or 160
+  if #one_line > limit then one_line = one_line:sub(1, limit) .. "..." end
+  return one_line
+end
+
+-- The Build run's state in one `gh` call. Returns the parsed object, or nil + a human reason + whether
+-- the failure looks PERMANENT.
+--
+-- That last distinction is the whole point. `gh` exiting non-zero means gh itself rejected the request
+-- (an unsupported --json field, a repo the token cannot see) - that will not fix itself, so the caller
+-- should say so immediately. Output that merely fails to parse while gh exited 0 is NOT permanent: it
+-- may be a blip, and failing the stage on one odd read fails Builds that went on to succeed. The reason
+-- carries an excerpt of what gh printed, so a recurrence is diagnosable instead of mysterious.
 local function build_run_state(repo, run_id)
   local function view(fields)
     return sh("gh run view " .. run_id .. " --repo " .. repo .. " --json " .. fields)
@@ -429,11 +444,21 @@ local function build_run_state(repo, run_id)
     if base:ok() then build_fields = BUILD_FIELDS_BASE; r = base end
   end
   if not r:ok() then
-    local why = trim(r.stderr) ~= "" and trim(r.stderr) or trim(r.stdout)
-    return nil, why ~= "" and why:gsub("%s+", " ") or ("gh run view exited " .. tostring(r.code))
+    local why = trim(r.stderr) ~= "" and r.stderr or r.stdout
+    why = excerpt(why)
+    return nil, (why ~= "" and why or ("gh run view exited " .. tostring(r.code))), true
   end
-  local ok, data = pcall(prova.parse.json, r.stdout)
-  if not ok or type(data) ~= "table" then return nil, "gh run view returned unreadable JSON" end
+  -- Pull the JSON object out rather than parsing the whole stream, so a notice line printed alongside it
+  -- doesn't make the read fail.
+  local body = r.stdout:match("%b{}")
+  if not body then
+    return nil, string.format("gh run view exited 0 with no JSON (%d bytes: %s)",
+      #r.stdout, excerpt(r.stdout, 80))
+  end
+  local ok, data = pcall(prova.parse.json, body)
+  if not ok or type(data) ~= "table" then
+    return nil, "gh run view returned unparseable JSON: " .. excerpt(body, 80)
+  end
   return data
 end
 
@@ -485,19 +510,38 @@ local function log_build_failure(t, repo, run_id, url, what)
   end
 end
 
+-- How many consecutive unreadable state reads mean a real problem rather than a blip. At the default
+-- 15s poll interval that is about 75 seconds of nothing readable before the stage gives up.
+local UNREADABLE_STRIKES = 5
+
 -- Wait for the Build run to finish and return its state. `already_seen` is the signature of an attempt
 -- whose result a previous wait already consumed: while gh still reports THAT attempt as completed, the
 -- re-run has not registered yet and we keep waiting. It is nil on the first wait - there is nothing to
 -- disambiguate, so the first `completed` is the answer and a Build that passes first time continues
 -- immediately, with no dependence on any optional field.
 local function await_build(t, cfg, repo, run_id, desc, already_seen)
-  local unreadable
-  return poll(t, desc, cfg.timeouts.build, cfg.timeouts.poll_interval, function()
-    local s; s, unreadable = build_run_state(repo, run_id)
-    if not s or s.status ~= "completed" then return nil end
+  local reason, strikes = nil, 0
+  local final = poll(t, desc, cfg.timeouts.build, cfg.timeouts.poll_interval, function()
+    local s; s, reason = build_run_state(repo, run_id)
+    if not s then
+      -- An unreadable run must never masquerade as a long wait (the YP6M-3183 failure), but one odd read
+      -- must not fail a Build either (the YP6M-3185 failure). So: ride out a few, then stop and report.
+      -- Reported by returning a sentinel rather than raising - prova.retry SWALLOWS an error from the
+      -- predicate and retries to the timeout, which is the very failure mode being guarded here.
+      strikes = strikes + 1
+      if strikes >= UNREADABLE_STRIKES then return { unreadable = reason } end
+      return nil
+    end
+    strikes, reason = 0, nil
+    if s.status ~= "completed" then return nil end
     if already_seen and finished_signature(s) == already_seen then return nil end
     return s
-  end, { tick = function() return unreadable or build_brief(repo, run_id) end })
+  end, { tick = function() return reason or build_brief(repo, run_id) end })
+  if final and final.unreadable then
+    error(string.format("cannot read Build run %s - %d consecutive attempts failed: %s",
+      run_id, UNREADABLE_STRIKES, final.unreadable), 0)
+  end
+  return final
 end
 
 ------------------------------------------------------------------------------------------
@@ -654,19 +698,22 @@ function stages.build(t, run)
   local url = sh_out("gh run view " .. run_id .. " --repo " .. state.repo .. " --json url -q .url")
   t:log("run " .. run_id .. " - " .. url)
 
-  -- Prove the state read works before settling in to wait on it. If it is broken - an unsupported --json
-  -- field on an older gh, a token that cannot see the repo - fail NOW, with gh's own message: polling
-  -- first turns that into a silent `timeouts.build` timeout on a Build that had SUCCEEDED, which is
-  -- exactly how this stage failed before. A few tries first, so a transient blip is not a verdict.
-  local unreadable
+  -- Prove the state read works before settling in to wait on it, but fail up front ONLY when gh itself
+  -- rejected the request - an unsupported --json field on an older gh, a repo the token cannot see. That
+  -- will not fix itself, and polling through it turns it into a silent `timeouts.build` timeout on a
+  -- Build that had SUCCEEDED. Anything else (gh exited 0, output just wasn't parseable) is left to the
+  -- wait, which rides out a few and then reports: one odd read must not fail a Build that is fine.
+  local blocked, permanent
   for probe = 1, 3 do
-    local s; s, unreadable = build_run_state(state.repo, run_id)
-    if s then break end
+    local s, why, fatal = build_run_state(state.repo, run_id)
+    blocked, permanent = (not s) and why or nil, fatal
+    if s or not fatal then break end
     if probe < 3 and cfg.timeouts.stability_interval > 0 then
       prova.sleep(cfg.timeouts.stability_interval * 1000)
     end
   end
-  if unreadable then error("cannot read Build run " .. run_id .. ": " .. unreadable, 0) end
+  if blocked and permanent then error("cannot read Build run " .. run_id .. ": " .. blocked, 0) end
+  if blocked then t:log("Build run not readable yet (" .. blocked .. ") - waiting anyway") end
 
   -- A failed Build is re-run in place (`gh run rerun` = a new attempt on the SAME run) up to
   -- cfg.build_retries times, since a fresh repo's first build fails on infrastructure flake often

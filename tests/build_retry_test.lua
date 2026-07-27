@@ -45,6 +45,11 @@ local function fake_gh(opts)
     if cmd:find("--json status,conclusion", 1, true) then
       calls.state_reads = calls.state_reads + 1
       if opts.unreadable then return res(1, "", "could not find any workflow run") end
+      -- gh exits 0 but prints nothing parseable. `blank_reads` makes it transient (the first N reads),
+      -- `always_blank` makes it permanent.
+      if opts.always_blank or (opts.blank_reads or 0) >= calls.state_reads then
+        return res(0, opts.blank_output or "")
+      end
       local asks_attempt = cmd:find("attempt", 1, true) ~= nil
       if asks_attempt and opts.no_attempt_field then
         return res(1, "", 'Unknown JSON field: "attempt"\nAvailable fields:\n  conclusion\n  status')
@@ -111,6 +116,35 @@ prova.test("re-runs still work on a gh with no `attempt` field", function(t)
     { conclusions = { "failure", "success" }, retries = 3, no_attempt_field = true })
   t:expect(ok, "stage passed on attempt 2: " .. err):is_true()
   t:expect(calls.reruns, "exactly one re-run"):equals(1)
+end)
+
+prova.test("a blank read does not fail a Build that is fine", function(t)
+  -- The reported failure: gh exited 0 but printed nothing parseable, and the up-front probe treated that
+  -- as fatal - killing the stage on a Build that was progressing normally. gh exiting 0 is not a verdict,
+  -- so the wait must ride it out.
+  local ok, err, calls = build(t, { conclusions = { "success" }, retries = 3, blank_reads = 4 })
+  t:expect(ok, "stage passed once the run became readable: " .. err):is_true()
+  t:expect(calls.reruns, "and it did not re-run anything"):equals(0)
+end)
+
+prova.test("a notice printed alongside the JSON is tolerated", function(t)
+  -- Anything gh prints around the object must not make the read fail; the object is extracted, not the
+  -- whole stream parsed.
+  local ok, err = build(t, { conclusions = { "success" }, retries = 3, blank_reads = 1,
+    blank_output = "A new release of gh is available: 2.40.0 -> 2.96.0\n" })
+  t:expect(ok, "stage passed: " .. err):is_true()
+end)
+
+prova.test("a persistently unreadable run gives up quickly, not after the full timeout", function(t)
+  -- The other direction: exit-0-but-blank forever must not become a 30-minute wait either. It gives up
+  -- after a handful of consecutive strikes, and the error names what gh actually printed.
+  local ok, err, calls = build(t, { conclusions = { "success" }, retries = 3, always_blank = true })
+  t:expect(ok, "stage failed"):is_false()
+  t:expect(err, "the error says the run could not be read"):contains("cannot read Build run")
+  t:expect(err, "it names the consecutive-failure count"):contains("consecutive attempts failed")
+  t:expect(err, "and what gh returned"):contains("exited 0 with no JSON")
+  t:expect(err, "it is not reported as a timeout"):never():contains("timed out")
+  t:expect(calls.state_reads < 20, "gave up in a handful of reads, not " .. calls.state_reads):is_true()
 end)
 
 prova.test("an unreadable run fails immediately rather than timing out", function(t)
