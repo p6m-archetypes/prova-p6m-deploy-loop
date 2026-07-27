@@ -156,6 +156,23 @@ function deploy.step(f, run, key, label) end
 ---@return prova.FlowBuilder f
 function deploy.attach(f, run, keys) end
 
+--- Mask every credential this can recognize in `text`, for anything about to be logged. The plugin runs
+--- its own echoed output (a failed Build's log tail, archetect's stderr, poll diagnostics) through this
+--- already; call it on output YOUR steps log. GitHub's `***` masking only covers a secret's exact
+--- registered value, so it misses tokens minted during a run, secrets base64'd into a config, and
+--- credentials embedded in a URL - all of which this catches by shape, key name, or registered value.
+--- Non-strings pass through untouched. Never use it on text you parse - output only.
+---@param text string|nil
+---@return string|nil
+function deploy.redact(text) end
+
+--- Register an exact value that must never reach the console; `deploy.redact` masks it from then on.
+--- Returns the value unchanged, so it can wrap the fetch itself:
+--- `local token = deploy.register_secret(gh_token())`. Values under 8 characters are ignored.
+---@param value string|nil
+---@return string|nil value   # the same value, unchanged
+function deploy.register_secret(value) end
+
 --- Register the standard ordered deploy-loop as a `prova.flow` (shared run + teardown + all stages).
 --- Call with a config table, or `(name, config)` to name the flow.
 ---@overload fun(config?: deploy.Config)

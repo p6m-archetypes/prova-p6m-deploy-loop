@@ -14,6 +14,8 @@ prova.test("exports the documented surface", function(t)
   t:expect(type(deploy.attach), "deploy.attach"):equals("function")
   t:expect(type(deploy.resolve), "deploy.resolve"):equals("function")
   t:expect(type(deploy.from_env), "deploy.from_env"):equals("function")
+  t:expect(type(deploy.redact), "deploy.redact"):equals("function")
+  t:expect(type(deploy.register_secret), "deploy.register_secret"):equals("function")
   t:expect(type(deploy.defaults), "deploy.defaults"):equals("table")
   for _, name in ipairs(ALL_STAGES) do
     t:expect(type(deploy.stages[name]), "stage " .. name):equals("function")
@@ -31,7 +33,7 @@ end)
 prova.test("step + attach register onto a flow builder", function(t)
   -- A minimal fake flow builder records the (label) of each registered step.
   local registered = {}
-  local fake_f = { step = function(self, label) registered[#registered + 1] = label end }
+  local fake_f = { step = function(_, label) registered[#registered + 1] = label end }
   local fake_run = {}   -- deploy.step only passes it through to t:use at run time
 
   deploy.step(fake_f, fake_run, "render")
@@ -48,7 +50,7 @@ prova.test("step + attach register onto a flow builder", function(t)
 end)
 
 prova.test("carries the requested default timeouts", function(t)
-  local d = deploy.defaults.timeouts
+  local d = deploy.defaults.timeouts or {}
   t:expect(d.argo_appear, "ArgoCD appear default = 5 min"):equals(300)
   t:expect(d.deployment, "Deployment healthy default = 3 min"):equals(180)
   t:expect(d.pods_stable, "pods stable default = 30 s"):equals(30)
