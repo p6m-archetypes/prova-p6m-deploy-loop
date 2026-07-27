@@ -75,6 +75,33 @@ Total attempts are `1 + build_retries` (default `1 + 3`), each with the full `ti
 if you expect to use them all, raise `flow_timeout` to match (4 x 1800 s exceeds the default `5400s`).
 Set `build_retries = 0` for fail-on-first-failure.
 
+### Credentials never reach the console
+
+When a Build fails, the step tails the failed steps' log so the run is diagnosable inline - teardown
+wipes the repo moments later. GitHub Actions masks *registered* secrets as `***`, but that only matches
+a secret's exact value, so a workflow log still carries credentials in the clear:
+
+- tokens minted during the run - `GITHUB_TOKEN`, an OIDC exchange, a JFrog access token,
+- a secret transformed before it was printed - base64'd into a docker/npm config, URL-encoded, or
+  embedded in a clone/registry URL as `user:token@host`,
+- a tool echoing its own auth - `set -x` traces, `curl -v` headers, config dumps.
+
+Every external output this plugin echoes therefore goes through `deploy.redact` first, which masks by
+registered value, by credential shape (GitHub/JFrog/AWS/npm/Slack tokens, JWTs, PEM blocks,
+`Authorization` headers, URL userinfo), and by key name (`*_TOKEN=`, `"auth":`, `--password`, …).
+Ordinary build output is left intact - the log is the only diagnostic a failed run leaves behind, so
+over-redaction is treated as a real cost.
+
+Call it on anything your own steps log:
+
+```lua
+local out = shell.run("some-tool --verbose")
+t:log(deploy.redact(out.stdout))
+deploy.register_secret(my_token)   -- also mask this exact value from here on
+```
+
+Redaction is for output only - nothing parsed for control flow passes through it.
+
 Teardown runs at the end - whether the flow passed, failed, or skipped - unless `keep_resources`
 is set: it removes `kubernetes/<project>/` from the `.platform` repo (rebase-and-retry push to the
 unprotected `main`, never force) and archives/deletes the test repo.

@@ -136,6 +136,153 @@ local function trim(s) return (s or ""):gsub("^%s+", ""):gsub("%s+$", "") end
 local function sh(cmd, opts) return shell.run(cmd, opts) end
 local function sh_out(cmd) return trim(sh(cmd, { check = true }).stdout) end
 
+------------------------------------------------------------------------------------------
+-- Redaction
+------------------------------------------------------------------------------------------
+-- GitHub Actions masks REGISTERED secrets as *** in run logs, but that only covers a secret's exact
+-- value. Workflow logs routinely carry credentials it cannot know to mask:
+--   * tokens minted during the run - GITHUB_TOKEN, an OIDC exchange, a JFrog access token,
+--   * a secret transformed before it is printed - base64'd into a docker/npm config, URL-encoded,
+--     or embedded in a clone/registry URL as userinfo,
+--   * a tool echoing its own auth - `set -x` traces, `curl -v` headers, config dumps.
+-- Since this plugin tails a failed run's log to the console, it must not relay any of that. Every
+-- external output it echoes goes through `deploy.redact` first, which masks in two layers: exact
+-- values registered at runtime (the strongest match), then the shape/context patterns below.
+--
+-- Redaction is for OUTPUT ONLY - nothing parsed for control flow (digests, conclusions, run ids) is
+-- passed through it.
+
+local registered_secrets = {}
+
+local function pattern_escape(s) return (s:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%1")) end
+
+-- A key or flag name whose value is a credential. Substring match, case-insensitive, so it catches
+-- ARTIFACTORY_IDENTITY_TOKEN, AZURE_CLIENT_SECRET, AccountKey, --registry-password, "auth", ...
+local SECRET_KEY_WORDS = {
+  "secret", "token", "password", "passwd", "passphrase", "credential", "apikey", "api_key",
+  "accesskey", "access_key", "privatekey", "private_key", "accountkey", "account_key",
+  "connectionstring", "connection_string", "signature", "sas",
+}
+
+local function is_secret_key(key)
+  local k = key:lower()
+  if k == "auth" or k == "authorization" then return true end
+  for _, word in ipairs(SECRET_KEY_WORDS) do
+    if k:find(word, 1, true) then return true end
+  end
+  return false
+end
+
+-- Mask a value but keep the quoting/JSON punctuation around it, so a redacted line still reads as the
+-- structure it was ("auth": "***" rather than "auth": ***). Already-masked values are left alone.
+local function mask_value(v)
+  local lead = v:match('^[%[{%("\']*') or ""
+  local trail = v:match('[%]}%)"\',;]*$') or ""
+  local core = v:sub(#lead + 1, #v - #trail)
+  if core == "" or core == "***" then return v end
+  return lead .. "***" .. trail
+end
+
+-- Mask the value of every `key=value` / `key: value` / `"key": "value"` pair whose key names a secret.
+--
+-- Hand-rolled rather than a `gsub` because gsub consumes a whole match even when the key turns out to
+-- be harmless - which hides any pair NESTED inside that span, and both variants of that bug leak a real
+-- credential:
+--   * {"auths":{"ybor.jfrog.io":{"auth":"<secret>"}}} - the outer key "auths" matches with everything
+--     up to the first } as its value, so the inner "auth" is never examined;
+--   * env: AZURE_CLIENT_SECRET=<secret> - the harmless key "env" swallows the whole rest of the line.
+-- Declining a key here advances the cursor past the KEY AND SEPARATOR only, leaving the value region
+-- open to the scan, so nested pairs are always reached. (Both cases are covered in redact_test.lua.)
+--
+-- The separator tolerates only spaces/tabs, never a newline: `%s*` would let a bare `password:` at the
+-- end of a line mask the first word of the NEXT line.
+local function mask_pairs(text)
+  local out, pos = {}, 1
+  while pos <= #text do
+    local s, e, key = text:find('([%w_%-%.]+)["\']?[ \t]*[=:][ \t]*', pos)
+    if not s then break end
+
+    local masked
+    -- A quoted value: mask inside the quotes, keeping them.
+    local _, q_end, open, value, close = text:find('^(["\'])([^"\']*)(["\'])', e + 1)
+    if q_end then
+      if value ~= "" and is_secret_key(key) then masked = open .. "***" .. close end
+    else
+      -- A bare value: stops at whitespace and JSON/shell separators, so it never spans lines or
+      -- crosses into a nested object.
+      local _, v_end, bare = text:find('^([^%s,;{}%[%]"\']+)', e + 1)
+      if v_end and is_secret_key(key) then masked, q_end = mask_value(bare), v_end end
+    end
+
+    out[#out + 1] = text:sub(pos, e)
+    pos = e + 1
+    if masked then
+      out[#out + 1] = masked
+      pos = q_end + 1
+    end
+  end
+  out[#out + 1] = text:sub(pos)
+  return table.concat(out)
+end
+
+-- Credential shapes worth masking wherever they appear, with no key to go on. Ordered: the header
+-- rules run before the token shapes so they swallow a whole header value rather than one word of it.
+local SECRET_PATTERNS = {
+  { "([Aa]uthorization%s*:%s*)[^\r\n]+", "%1***" },      -- header, incl. the scheme + token
+  { "([Bb]earer%s+)[%w%-%._~%+/=]+", "%1***" },
+  { "([Bb]asic%s+)[%w%+/=]+", "%1***" },
+  { "(%a[%w%+%-%.]*://)[^/@%s]+@", "%1***:***@" },       -- URL userinfo (x-access-token:ghs_..@)
+  { "%f[%w]gh[pousr]_[%w]+", "***" },                    -- GitHub PAT / OAuth / user / server / refresh
+  { "%f[%w]github_pat_[%w_]+", "***" },
+  { "%f[%w]eyJ[%w%-_]*%.[%w%-_]+%.[%w%-_]+", "***" },    -- JWT: JFrog access, OIDC, k8s SA tokens
+  { "%f[%w]cmVmdGtu[%w%+/=]+", "***" },                  -- JFrog reference token (base64 "reftkn")
+  { "%f[%w]A[KS]IA[%u%d]+", "***" },                     -- AWS access key id (long-lived / temporary)
+  { "%f[%w]npm_[%w]+", "***" },
+  { "%f[%w]xox[abprs]%-[%w%-]+", "***" },                -- Slack
+  { "https://hooks%.slack%.com/services/[%w%-/]+", "***" },
+}
+
+-- Mask every credential this can recognize in `text`. Safe to call on anything - non-strings and the
+-- empty string pass through untouched.
+function deploy.redact(text)
+  if type(text) ~= "string" or text == "" then return text end
+
+  -- Whole PEM blocks first: they are the only secret that spans lines.
+  text = text:gsub("%-%-%-%-%-BEGIN[^\n]*PRIVATE KEY%-%-%-%-%-.-%-%-%-%-%-END[^\n]*%-%-%-%-%-",
+    "***** REDACTED PRIVATE KEY *****")
+
+  -- Exact values we hold (see deploy.register_secret) - the only layer that catches an opaque
+  -- random with no telltale shape or key.
+  for value in pairs(registered_secrets) do
+    text = text:gsub(pattern_escape(value), "***")
+  end
+
+  for _, rule in ipairs(SECRET_PATTERNS) do
+    text = text:gsub(rule[1], rule[2])
+  end
+
+  -- key=value / key: value / "key": "value" - the workhorse for opaque secrets, which are only
+  -- recognizable by what they are assigned to.
+  text = mask_pairs(text)
+
+  -- The space-separated flag form: --token abc123, --registry-password hunter2. The value must not
+  -- itself start with "-", so a declined flag can never consume the NEXT flag as its value and hide it
+  -- (`--debug --password <secret>`). A single-letter flag (-p) is unknowable and stays in the clear.
+  text = text:gsub("(%-%-?[%w%-]+)([ \t]+)([^%s%-][^%s]*)", function(flag, sep, value)
+    if is_secret_key((flag:gsub("^%-+", ""))) then return flag .. sep .. mask_value(value) end
+  end)
+
+  return text
+end
+
+-- Register an exact value that must never reach the console, and return it unchanged so it can wrap
+-- the fetch itself: `local token = deploy.register_secret(trim(sh("gh auth token").stdout))`. Values
+-- under 8 characters are ignored - too short to be a credential, and masking them would shred the log.
+function deploy.register_secret(value)
+  if type(value) == "string" and #value >= 8 then registered_secrets[value] = true end
+  return value
+end
+
 -- Poll `fn` until truthy or the timeout elapses, logging a heartbeat on EVERY attempt so a live run
 -- is watchable (elapsed/timeout + a concise observed-state note). On timeout, raise an error naming
 -- what we waited for AND - if a diagnostic is given - a full snapshot of the current state, so a
@@ -152,7 +299,7 @@ local function poll(t, desc, timeout_s, interval_s, fn, cb)
     local note = ""
     if cb.tick then
       local ok, s = pcall(cb.tick)
-      if ok and s and s ~= "" then note = " - " .. s end
+      if ok and s and s ~= "" then note = " - " .. deploy.redact(s) end
     end
     t:log(string.format("  ... %ds/%ds elapsed%s", os.time() - start, timeout_s, note))
     return nil
@@ -166,7 +313,7 @@ local function poll(t, desc, timeout_s, interval_s, fn, cb)
   local diag = cb.diag or cb.tick
   if diag then
     local dok, d = pcall(diag)
-    if dok and d and d ~= "" then extra = "\n  current state:\n" .. d end
+    if dok and d and d ~= "" then extra = "\n  current state:\n" .. deploy.redact(d) end
   end
   error("timed out after " .. timeout_s .. "s waiting for: " .. desc .. extra, 0)
 end
@@ -292,16 +439,20 @@ local function build_brief(repo, run_id)
 end
 
 -- Log a failed Build's run URL, the failed job/step names, and the failed steps' log tail so a run
--- that dies mid-loop is diagnosable inline (teardown wipes the repo right after). GitHub Actions
--- masks registered secrets as *** in run logs, so `--log-failed` never surfaces raw credentials; we
--- still tail it (not the full run log) to keep the console readable and the blast radius small.
+-- that dies mid-loop is diagnosable inline (teardown wipes the repo right after). The log tail is the
+-- one place this plugin relays third-party output verbatim, so it goes through `deploy.redact`: a
+-- workflow log carries credentials GitHub's own *** masking misses whenever the printed form isn't the
+-- registered value (runtime-minted tokens, base64'd configs, tokens embedded in URLs). We tail it
+-- rather than dumping the whole run log, which keeps both the console and the blast radius small.
 local function log_build_failure(t, repo, run_id, url, what)
   t:log((what or "Build") .. " failed - see " .. url)
   local failed = sh("gh run view " .. run_id .. " --repo " .. repo ..
     [[ --json jobs -q '.jobs[] | select(.conclusion=="failure") | "  job: " + .name, (.steps[] | select(.conclusion=="failure") | "    step: " + .name)']])
-  if trim(failed.stdout) ~= "" then t:log("failed jobs/steps:\n" .. failed.stdout) end
+  if trim(failed.stdout) ~= "" then t:log("failed jobs/steps:\n" .. deploy.redact(failed.stdout)) end
   local logs = sh("gh run view " .. run_id .. " --repo " .. repo .. " --log-failed 2>/dev/null | tail -n 100")
-  if trim(logs.stdout) ~= "" then t:log("failed step log (last 100 lines, secrets masked by GitHub):\n" .. logs.stdout) end
+  if trim(logs.stdout) ~= "" then
+    t:log("failed step log (last 100 lines, credentials redacted):\n" .. deploy.redact(logs.stdout))
+  end
 end
 
 -- Wait for attempt #`attempt` of Build run `run_id` to finish, and return its conclusion. Keyed on the
@@ -328,7 +479,9 @@ end
 -- to bypass). Never force-pushes: on a concurrent-push reject it rebases and retries. Once the folder
 -- is gone the ApplicationSet prunes the ArgoCD app + namespace.
 local function teardown_platform(log, cfg, project)
-  local token = trim(sh("gh auth token").stdout)
+  -- The token is embedded in the push URL below, so register it: from here on `deploy.redact` masks it
+  -- out of anything this run echoes, including a git error that quotes the remote back at us.
+  local token = deploy.register_secret(trim(sh("gh auth token").stdout))
   if token == "" then log("no GitHub token for the .platform push"); return end
   local tmp = fs.tempdir()
   local url = "https://x-access-token:" .. token .. "@github.com/" .. cfg.platform_repo .. ".git"
@@ -428,8 +581,10 @@ function stages.render(t, run)
   end
   cmd = cmd .. " -A '" .. answers .. "' -a " .. cfg.prefix_key .. "='" .. cfg.project_prefix ..
     "' -D --destination '" .. out .. "'"
+  -- archetect's stderr can echo the registry credentials a composed library injects, so it is
+  -- redacted before it becomes an assertion message.
   local r = sh(cmd, { timeout = cfg.timeouts.render .. "s" })
-  t:expect(r.code, "archetect render\n" .. r.stderr):equals(0)
+  t:expect(r.code, "archetect render\n" .. deploy.redact(r.stderr)):equals(0)
 
   state.project_dir = sh_out("find '" .. out .. "' -mindepth 1 -maxdepth 1 -type d | head -1")
   t:expect(state.project_dir, "rendered project dir"):never():is_empty()
